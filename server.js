@@ -4,7 +4,7 @@ const request = require('request');
 const rp = require('request-promise');
 const bodyParser = require('body-parser');
 const express = require('express');
-const firebase = require('./firebase.js');
+const firebase = require('./exports/firebase/firebase.js');
 const iexCloudAPI = require('./exports/iexCloud/iexCloudAPI.js');
 const dateFormatter = require('./exports/utilities/dateformat.js');
 const redisClient = require('./exports/redis/client_async.js');
@@ -13,11 +13,12 @@ dotenv.config();
 
 firebase.initialize();
 
-
 const admin = firebase.admin();
 const database = firebase.database();
 const systemDatabase = firebase.systemDatabase();
 const firestore = firebase.firestore();
+
+const timezones = require('./routes/timezones.js');
 
 const app = express();
 const port = 3000;
@@ -166,22 +167,18 @@ function updateStockQuote(quote) {
       localDate.setSeconds(localDate.getSeconds() + timezoneOffset);
       let minute = dateFormatter.formatDateHHMM(localDate);
 
+      quoteData.minute = minute;
       quoteData.latestUpdateLocal = localDate.getTime();
       updateObject[stockPath + "/quote"] = quoteData;
-
-      let priceObject = {
-        price: quoteData.latestPrice,
-        minute: minute
-      }
 
       let isSameDay = dateFormatter.sameDay(oldDate, localDate);
 
       if (isSameDay) {
-        updateObject[`global/stock/intraday/${symbol}/${minute}`] = priceObject;
+        updateObject[`global/stock/intraday/${symbol}/${minute}`] = quoteData.latestPrice;
 
       } else {
         let intradayObject = {};
-        intradayObject[minute] = priceObject;
+        intradayObject[minute] = quoteData.latestPrice;
         updateObject[`global/stock/intraday/${symbol}`] = intradayObject;
       }
 
@@ -259,7 +256,7 @@ function openStream(groupIndex) {
 
       var quotes = [];
       chunks.forEach( function (chunk) {
-        //console.log("CHUNK: " + chunk);
+
         if (chunk) {
           try {
             var obj = JSON.parse(chunk)[0];
@@ -268,7 +265,7 @@ function openStream(groupIndex) {
             }
 
           } catch (e) {
-            console.log("Error parsing: " + e);
+
           }
         }
 
@@ -319,12 +316,12 @@ app.delete('/watchlist', (req, res) => {
   });
 })
 
-app.get('/flushall', (req, res) => {
-  redisClient.flushall();
-  return res.send({
-    success: true
-  })
-});
+// app.get('/flushall', (req, res) => {
+//   redisClient.flushall();
+//   return res.send({
+//     success: true
+//   })
+// });
 
 app.post('/user/watchlist', (req, res) => {
   let uid = req.uid;
@@ -355,7 +352,10 @@ app.post('/user/watchlist', (req, res) => {
         if (intradaySnapshot.exists()) {
           let intradayData = intradaySnapshot.val();
           for (var minute in intradayData) {
-            intradayArray.push(intradayData[minute]);
+            intradayArray.push({
+              minute: minute,
+              price: intradayData[minute]
+            });
           }
 
           intradayArray.sort((a, b) => (a.minute > b.minute) ? 1 : -1);
@@ -394,6 +394,8 @@ app.post('/user/watchlist', (req, res) => {
           var localDate = new Date(quoteData.latestUpdate);
           localDate.setSeconds(localDate.getSeconds() + timezoneOffset);
 
+          let quoteMinute = dateFormatter.formatDateHHMM(localDate);
+          quoteData.minute = quoteMinute;
           quoteData.latestUpdateLocal = localDate.getTime();
 
           if (quoteData && intradayData) {
@@ -406,19 +408,21 @@ app.post('/user/watchlist', (req, res) => {
               let result = intradayData[i];
 
               let minute = result.minute;
-              var price = -1;
+              var price;
               if (result.average) {
                 price = result.average;
               } else if (result.marketAverage) {
                 price = result.marketAverage;
               }
-              var intradayQuote = {
-                price: price,
-                minute: minute
+
+              if (price) {
+                intradayObject[minute] = price;
+                intradayArray.push({
+                  minute: minute,
+                  price: price
+                });
               }
 
-              intradayObject[minute] = intradayQuote;
-              intradayArray.push(intradayQuote);
             }
 
             intradayArray.sort((a, b) => (a.minute > b.minute) ? 1 : -1);
@@ -446,9 +450,6 @@ app.post('/user/watchlist', (req, res) => {
     }
 
     return res.send(responseData);
-  }).catch ( err => {
-    console.log(err);
-    return res.send(err);
   }).then( () => {
     return redisClient.hsetnx('watchlist', symbol, true);
   }).then( resp => {
@@ -460,7 +461,7 @@ app.post('/user/watchlist', (req, res) => {
     return
   }).catch ( err => {
     console.log(err);
-    return
+    return res.send(err);
   })
 
 });
@@ -575,59 +576,6 @@ app.get('/timezone/:region/:city', (req, res) => {
   })
 });
 
-app.put('/timezone/:region/:city', (req, res) => {
-  let region = req.params.region;
-  let city = req.params.city;
-  let uri = `http://worldtimeapi.org/api/timezone/${region}/${city}`;
-  let options = {
-    uri: uri,
-    json: true
-  }
-
-  var data;
-  return rp(options).then( results => {
-    let docID = `${region}-${city}`;
-    data = {
-      timezone: results.timezone,
-      raw_offset: results.raw_offset,
-      dst_offset: results.dst_offset,
-      dst_start: results.dst_from,
-      dst_end: results.dst_until,
-      dst: results.dst,
-      abbreviation: results.abbreviation
-    }
-    let docRef = firestore.collection('timezones').doc(docID);
-    return docRef.set(data);
-  }).then( () => {
-    return res.send(data);
-  }).catch( err => {
-    console.log(err);
-    return res.send(err);
-  })
-});
-
-app.post('/timezone/:region/:city', (req, res) => {
-  let region = req.params.region;
-  let city = req.params.city;
-  let hashKey = `timezone:${region}-${city}`;
-
-  let data = {
-    dst: req.body.dst,
-    dst_end: req.body.dst_end,
-    dst_offset: req.body.dst_offset,
-    dst_start: req.body.dst_start,
-    raw_offset: req.body.raw_offset
-  }
-
-  return redisClient.hmset(hashKey, data).then ( resp => {
-    return res.send(resp);
-  }).catch( err => {
-    return res.send(err);
-  })
-
-})
-
-
 app.delete('/timezone/:region/:city', (req, res) => {
   let region = req.params.region;
   let city = req.params.city;
@@ -651,7 +599,7 @@ app.delete('/timezone/:region/:city', (req, res) => {
   });
 })
 
-
+app.use('/timezones', timezones);
 
 
 function init() {
